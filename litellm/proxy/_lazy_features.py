@@ -344,6 +344,89 @@ def attach_lazy_features(app: "FastAPI") -> None:
     app.add_middleware(LazyFeatureMiddleware, fastapi_app=app)
 
 
+def restrict_lazy_features_to_component(
+    app: "FastAPI",
+    *,
+    allowed_path_prefixes: Tuple[str, ...],
+    allowed_exact_paths: "frozenset[str]",
+    re_trim: Callable[["FastAPI"], None],
+) -> None:
+    """Restrict the already-attached ``LazyFeatureMiddleware`` to a component's
+    path allowlist.
+
+    The componentized deployments (``gateway/main.py``, ``backend/main.py``)
+    trim ``app.router.routes`` once at startup. ``LazyFeatureMiddleware``
+    however registers routers on-demand at request time, AFTER that trim has
+    run — so a single request to an unallowed-but-lazy path (e.g. ``/guardrails``
+    on the gateway) would import the management router and leave its routes
+    permanently mounted on the wrong component.
+
+    This helper closes the gap by:
+
+    1. Dropping ``LAZY_FEATURES`` whose path prefixes have no overlap with the
+       component's allowlist. The middleware never even considers them, so a
+       misdirected request can't trigger the (heavy, ~700 MB at peak) import.
+    2. Wrapping each kept feature's ``register_fn`` so ``re_trim(app)`` runs
+       immediately after the router is included. Features whose prefixes
+       partially overlap (e.g. ``anthropic_passthrough`` registers both
+       ``/v1/messages`` and ``/api/event_logging``) get their non-allowed
+       routes filtered out the same way the startup trim handles them.
+
+    Must be called once after ``attach_lazy_features`` ran (i.e. after
+    ``proxy_server`` was imported) and before the FastAPI middleware stack
+    is built — typically right at module load in the component entrypoint.
+    """
+
+    def _prefix_overlaps(prefix: str) -> bool:
+        if prefix in allowed_exact_paths:
+            return True
+        return any(
+            prefix.startswith(allowed) or allowed.startswith(prefix)
+            for allowed in allowed_path_prefixes
+        )
+
+    def _suffix_overlaps(suffix: str) -> bool:
+        return any(allowed.endswith(suffix) for allowed in allowed_path_prefixes)
+
+    def _wrap_register_fn(
+        original: Callable[["FastAPI", object], None],
+    ) -> Callable[["FastAPI", object], None]:
+        def _register_then_trim(target_app: "FastAPI", module: object) -> None:
+            original(target_app, module)
+            re_trim(target_app)
+
+        return _register_then_trim
+
+    filtered: list[LazyFeature] = []
+    for feat in LAZY_FEATURES:
+        if not (
+            any(_prefix_overlaps(p) for p in feat.path_prefixes)
+            or any(_suffix_overlaps(s) for s in feat.path_suffixes)
+        ):
+            continue
+        filtered.append(
+            LazyFeature(
+                name=feat.name,
+                module_path=feat.module_path,
+                path_prefixes=feat.path_prefixes,
+                register_fn=_wrap_register_fn(feat.register_fn),
+                path_suffixes=feat.path_suffixes,
+                persistent_swagger_stub=feat.persistent_swagger_stub,
+            )
+        )
+
+    for spec in app.user_middleware:
+        if spec.cls is LazyFeatureMiddleware:
+            spec.kwargs["features"] = tuple(filtered)
+            break
+    else:
+        raise RuntimeError(
+            "restrict_lazy_features_to_component: LazyFeatureMiddleware is not "
+            "attached to this app. Call attach_lazy_features (or import "
+            "litellm.proxy.proxy_server) first."
+        )
+
+
 def _make_warmup_router(app: "FastAPI") -> "APIRouter":
     """POST /lazy/warm/{name}: load a feature and return its partial openapi
     so the Swagger plugin can merge in-place without a full /openapi.json refetch.

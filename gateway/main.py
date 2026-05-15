@@ -23,6 +23,7 @@ from litellm.proxy.auth.rds_iam_token import init_iam_db_url_from_env
 
 init_iam_db_url_from_env()
 
+from litellm.proxy._lazy_features import restrict_lazy_features_to_component
 from litellm.proxy.proxy_server import app
 
 from gateway.routes.allowlist import GATEWAY_EXACT_PATHS, GATEWAY_PATH_PREFIXES
@@ -41,6 +42,29 @@ def _is_gateway_route(route) -> bool:
     return any(path.startswith(prefix) for prefix in GATEWAY_PATH_PREFIXES)
 
 
+def _trim_gateway_routes(target_app) -> None:
+    target_app.router.routes = [
+        r for r in target_app.router.routes if _is_gateway_route(r)
+    ]
+
+
+# LazyFeatureMiddleware (attached when proxy_server was imported above)
+# registers optional routers on first request. Without this hook, a single
+# request to e.g. /guardrails on a gateway pod would import the management
+# router and leave its routes mounted on the data-plane indefinitely — the
+# startup-time trim has long since finished. The hook (a) drops features
+# whose prefixes are entirely outside the gateway allowlist so their heavy
+# modules never get imported here, and (b) re-runs the route trim after each
+# kept feature loads so any partially-overlapping prefixes (e.g. anthropic
+# passthrough's /api/event_logging) don't sneak through.
+restrict_lazy_features_to_component(
+    app,
+    allowed_path_prefixes=GATEWAY_PATH_PREFIXES,
+    allowed_exact_paths=GATEWAY_EXACT_PATHS,
+    re_trim=_trim_gateway_routes,
+)
+
+
 # Wrap proxy_server's existing lifespan so the route trim runs *after* its
 # startup hooks (and any plugin code those hooks load) have had a chance to
 # register routes. A module-load filter would miss routes added during
@@ -52,7 +76,7 @@ _proxy_lifespan = app.router.lifespan_context
 @asynccontextmanager
 async def _gateway_lifespan(app_):
     async with _proxy_lifespan(app_):
-        app_.router.routes = [r for r in app_.router.routes if _is_gateway_route(r)]
+        _trim_gateway_routes(app_)
         yield
 
 
